@@ -1,5 +1,6 @@
 import logging
 import typing
+from functools import lru_cache
 
 from injector import inject, singleton
 from llama_index.core.indices.vector_store import VectorIndexRetriever, VectorStoreIndex
@@ -20,11 +21,15 @@ logger = logging.getLogger(__name__)
 def _doc_id_metadata_filter(
     context_filter: ContextFilter | None,
 ) -> MetadataFilters:
+    """
+    Faster construction of filters: build list with comprehension instead of repeated append().
+    Identical behavior to original.
+    """
     filters = MetadataFilters(filters=[], condition=FilterCondition.OR)
 
     if context_filter is not None and context_filter.docs_ids is not None:
-        for doc_id in context_filter.docs_ids:
-            filters.filters.append(MetadataFilter(key="doc_id", value=doc_id))
+        # list comprehension is marginally faster than a for-loop with append
+        filters.filters = [MetadataFilter(key="doc_id", value=doc_id) for doc_id in context_filter.docs_ids]
 
     return filters
 
@@ -33,11 +38,16 @@ def _doc_id_metadata_filter(
 class VectorStoreComponent:
     settings: Settings
     vector_store: BasePydanticVectorStore
+    _is_qdrant: bool
 
     @inject
     def __init__(self, settings: Settings) -> None:
+        # cache local ref to avoid repeated attribute lookups
         self.settings = settings
-        match settings.vectorstore.database:
+        db = settings.vectorstore.database
+        self._is_qdrant = db == "qdrant"
+
+        match db:
             case "postgres":
                 try:
                     from llama_index.vector_stores.postgres import (  # type: ignore
@@ -53,10 +63,12 @@ class VectorStoreComponent:
                         "Postgres settings not found. Please provide settings."
                     )
 
+                # call model_dump once and reuse
+                pg_params = settings.postgres.model_dump(exclude_none=True)
                 self.vector_store = typing.cast(
                     BasePydanticVectorStore,
                     PGVectorStore.from_params(
-                        **settings.postgres.model_dump(exclude_none=True),
+                        **pg_params,
                         table_name="embeddings",
                         embed_dim=settings.embedding.embed_dim,
                     ),
@@ -68,7 +80,6 @@ class VectorStoreComponent:
                     from chromadb.config import (  # type: ignore
                         Settings as ChromaSettings,
                     )
-
                     from private_gpt.components.vector_store.batched_chroma import (
                         BatchedChromaVectorStore,
                     )
@@ -77,9 +88,11 @@ class VectorStoreComponent:
                         "ChromaDB dependencies not found, install with `poetry install --extras vector-stores-chroma`"
                     ) from e
 
+                # compute path once
                 chroma_settings = ChromaSettings(anonymized_telemetry=False)
+                chroma_path = str((local_data_path / "chroma_db").absolute())
                 chroma_client = chromadb.PersistentClient(
-                    path=str((local_data_path / "chroma_db").absolute()),
+                    path=chroma_path,
                     settings=chroma_settings,
                 )
                 chroma_collection = chroma_client.get_or_create_collection(
@@ -111,15 +124,15 @@ class VectorStoreComponent:
                     )
                     client = QdrantClient()
                 else:
-                    client = QdrantClient(
-                        **settings.qdrant.model_dump(exclude_none=True)
-                    )
+                    qdrant_params = settings.qdrant.model_dump(exclude_none=True)
+                    client = QdrantClient(**qdrant_params)
+
                 self.vector_store = typing.cast(
                     BasePydanticVectorStore,
                     QdrantVectorStore(
                         client=client,
                         collection_name="make_this_parameterizable_per_api_call",
-                    ),  # TODO
+                    ),
                 )
 
             case "milvus":
@@ -149,14 +162,15 @@ class VectorStoreComponent:
                     )
 
                 else:
+                    milvus = settings.milvus
                     self.vector_store = typing.cast(
                         BasePydanticVectorStore,
                         MilvusVectorStore(
                             dim=settings.embedding.embed_dim,
-                            uri=settings.milvus.uri,
-                            token=settings.milvus.token,
-                            collection_name=settings.milvus.collection_name,
-                            overwrite=settings.milvus.overwrite,
+                            uri=milvus.uri,
+                            token=milvus.token,
+                            collection_name=milvus.collection_name,
+                            overwrite=milvus.overwrite,
                         ),
                     )
 
@@ -188,10 +202,8 @@ class VectorStoreComponent:
                     clickhouse_client=clickhouse_client
                 )
             case _:
-                # Should be unreachable
-                # The settings validator should have caught this
                 raise ValueError(
-                    f"Vectorstore database {settings.vectorstore.database} not supported"
+                    f"Vectorstore database {db} not supported"
                 )
 
     def get_retriever(
@@ -200,18 +212,24 @@ class VectorStoreComponent:
         context_filter: ContextFilter | None = None,
         similarity_top_k: int = 2,
     ) -> VectorIndexRetriever:
-        # This way we support qdrant (using doc_ids) and the rest (using filters)
+        """
+        Use cached boolean self._is_qdrant instead of repeated string comparisons.
+        Build the filters only when needed.
+        """
+        # localize for tiny speed-up
+        is_qdrant = self._is_qdrant
+
         return VectorIndexRetriever(
             index=index,
             similarity_top_k=similarity_top_k,
             doc_ids=context_filter.docs_ids if context_filter else None,
             filters=(
-                _doc_id_metadata_filter(context_filter)
-                if self.settings.vectorstore.database != "qdrant"
-                else None
+                _doc_id_metadata_filter(context_filter) if not is_qdrant else None
             ),
         )
 
     def close(self) -> None:
-        if hasattr(self.vector_store.client, "close"):
-            self.vector_store.client.close()
+        # safer and slightly cheaper: get client once
+        client = getattr(self.vector_store, "client", None)
+        if client is not None and hasattr(client, "close"):
+            client.close()
