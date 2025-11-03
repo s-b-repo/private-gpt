@@ -1,4 +1,6 @@
+import asyncio
 import logging
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -22,26 +24,25 @@ class LLMComponent:
     @inject
     def __init__(self, settings: Settings) -> None:
         llm_mode = settings.llm.mode
-        if settings.llm.tokenizer and settings.llm.mode != "mock":
-            # Try to download the tokenizer. If it fails, the LLM will still work
-            # using the default one, which is less accurate.
+
+        # If a tokenizer is configured and we're not in mock mode, try to download it.
+        # Do this in the background so initialization stays fast and compatible with
+        # the original framework behaviour (the LLM will still operate using the
+        # default tokenizer if this fails).
+        if getattr(settings.llm, "tokenizer", None) and settings.llm.mode != "mock":
             try:
-                set_global_tokenizer(
-                    AutoTokenizer.from_pretrained(
-                        pretrained_model_name_or_path=settings.llm.tokenizer,
-                        cache_dir=str(models_cache_path),
-                        token=settings.huggingface.access_token,
-                    )
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Failed to download tokenizer {settings.llm.tokenizer}: {e!s}"
-                    f"Please follow the instructions in the documentation to download it if needed: "
-                    f"https://docs.privategpt.dev/installation/getting-started/troubleshooting#tokenizer-setup."
-                    f"Falling back to default tokenizer."
-                )
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                # No running loop — use a daemon thread so constructor is non-blocking.
+                threading.Thread(
+                    target=LLMComponent._download_tokenizer, args=(settings,), daemon=True
+                ).start()
+            else:
+                # There is an event loop — offload to its executor so we don't block.
+                loop.run_in_executor(None, LLMComponent._download_tokenizer, settings)
 
         logger.info("Initializing the LLM in mode=%s", llm_mode)
+
         match settings.llm.mode:
             case "llamacpp":
                 try:
@@ -223,3 +224,39 @@ class LLMComponent:
                 )
             case "mock":
                 self.llm = MockLLM()
+
+    # ------------------------------------------------------------------
+    # Runs in a thread-pool or background thread so the constructor is never blocked
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _download_tokenizer(settings: Settings) -> None:
+        try:
+            hf_obj = getattr(settings, "huggingface", None)
+            hf_token = getattr(hf_obj, "access_token", None)
+
+            # Some versions of transformers accept `token=` (legacy) while others
+            # expect `use_auth_token=`. Try the original kwarg first for compatibility
+            # with the framework, then fall back to the modern name.
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    pretrained_model_name_or_path=settings.llm.tokenizer,
+                    cache_dir=str(models_cache_path),
+                    token=hf_token,
+                )
+            except TypeError:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    pretrained_model_name_or_path=settings.llm.tokenizer,
+                    cache_dir=str(models_cache_path),
+                    use_auth_token=hf_token,
+                )
+
+            set_global_tokenizer(tokenizer)
+        except Exception as e:
+            logger.warning(
+                "Failed to download tokenizer %s: %s "
+                "Please follow the instructions in the documentation to download it if needed: "
+                "https://docs.privategpt.dev/installation/getting-started/troubleshooting#tokenizer-setup . "
+                "Falling back to default tokenizer.",
+                getattr(settings.llm, "tokenizer", "(unknown)"),
+                e,
+            )
