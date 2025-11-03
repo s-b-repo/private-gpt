@@ -54,6 +54,11 @@ echo "Docker + docker-compose installed. Re-login to use docker without sudo (or
 sudo /usr/local/bin/docker-compose --profile ollama-cpu up
 
 ```
+### docker reset command "testing" 
+
+```
+sudo docker ps -aq | xargs -r sudo docker kill 2>/dev/null && sudo docker ps -aq | xargs -r sudo docker rm -f 2>/dev/null && sudo docker system prune -a --volumes -f
+```
 
 >[!WARNING]
 >  This README is not updated as frequently as the [documentation](https://docs.privategpt.dev/).
