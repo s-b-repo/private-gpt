@@ -41,6 +41,20 @@ client is provided to test the API, together with a set of useful tools such as 
 download script, ingestion script, documents folder watch, etc.
 
 ## 🎞️ Overview
+
+### one line runner
+```
+sudo apt update && sudo apt install -y docker.io curl && \
+sudo systemctl enable --now docker && \
+sudo apt remove -y docker-compose docker-compose-plugin 2>/dev/null || true && \
+sudo curl -fsSL "https://github.com/docker/compose/releases/download/v${COMPOSE_VER}/docker-compose-linux-x86_64" -o /usr/local/bin/docker-compose && \
+sudo chmod +x /usr/local/bin/docker-compose && \
+sudo usermod -aG docker "$USER" 2>/dev/null || true && \
+echo "Docker + docker-compose installed. Re-login to use docker without sudo (or keep using sudo). Now launching compose (as sudo)..." && \
+sudo /usr/local/bin/docker-compose --profile ollama-cpu up
+
+```
+
 >[!WARNING]
 >  This README is not updated as frequently as the [documentation](https://docs.privategpt.dev/).
 >  Please check it out for the latest updates!
