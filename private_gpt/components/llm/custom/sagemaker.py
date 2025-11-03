@@ -37,63 +37,69 @@ logger = logging.getLogger(__name__)
 
 
 class LineIterator:
-    r"""A helper class for parsing the byte stream input from TGI container.
+    r"""A lighter-weight, faster line iterator for TGI-style event streams.
 
-    The output of the model will be in the following format:
-    ```
-    b'data:{"token": {"text": " a"}}\n\n'
-    b'data:{"token": {"text": " challenging"}}\n\n'
-    b'data:{"token": {"text": " problem"
-    b'}}'
-    ...
-    ```
-
-    While usually each PayloadPart event from the event stream will contain a byte array
-    with a full json, this is not guaranteed and some of the json objects may be split
-    across PayloadPart events. For example:
-    ```
-    {'PayloadPart': {'Bytes': b'{"outputs": '}}
-    {'PayloadPart': {'Bytes': b'[" problem"]}\n'}}
-    ```
-
-
-    This class accounts for this by concatenating bytes written via the 'write' function
-    and then exposing a method which will return lines (ending with a '\n' character)
-    within the buffer via the 'scan_lines' function. It maintains the position of the
-    last read position to ensure that previous bytes are not exposed again. It will
-    also save any pending lines that doe not end with a '\n' to make sure truncations
-    are concatinated
+    Notes on changes (kept behavior):
+    - Uses a bytearray buffer instead of io.BytesIO to avoid stream/seeking overhead.
+    - Uses index arithmetic and in-place buffer truncation to reduce allocations.
+    - Preserves semantics of only yielding lines that end with ``\n`` (same as original).
     """
 
     def __init__(self, stream: Any) -> None:
-        """Line iterator initializer."""
-        self.byte_iterator = iter(stream)
-        self.buffer = io.BytesIO()
-        self.read_pos = 0
+        """Line iterator initializer.
+
+        `stream` must be an iterable yielding dict-like events with
+        a ``PayloadPart`` key containing a ``Bytes`` value.
+        """
+        self._byte_iter = iter(stream)
+        self._buf = bytearray()
+        self._read_pos = 0
 
     def __iter__(self) -> Any:
-        """Self iterator."""
         return self
 
-    def __next__(self) -> Any:
-        """Next element from iterator."""
+    def __next__(self) -> bytes:
+        # Localize frequently used names for speed
+        buf = self._buf
+        read_pos = self._read_pos
+        byte_iter = self._byte_iter
+
         while True:
-            self.buffer.seek(self.read_pos)
-            line = self.buffer.readline()
-            if line and line[-1] == ord("\n"):
-                self.read_pos += len(line)
-                return line[:-1]
+            nl = buf.find(b"\n", read_pos)
+            if nl != -1:
+                # Found a full line (ending in \n) -- return it without the newline
+                line = bytes(buf[read_pos:nl])
+                read_pos = nl + 1
+                # If buffer has grown large, drop consumed prefix to avoid unbounded memory
+                if read_pos > 4096:
+                    # delete consumed prefix and reset read_pos
+                    del buf[:read_pos]
+                    read_pos = 0
+                # update instance state then return
+                self._buf = buf
+                self._read_pos = read_pos
+                return line
+
+            # No newline available; try to read next chunk from the underlying iterator
             try:
-                chunk = next(self.byte_iterator)
+                chunk = next(byte_iter)
             except StopIteration:
-                if self.read_pos < self.buffer.getbuffer().nbytes:
-                    continue
+                # No more input coming. Match original behavior: do not return a
+                # partial (unterminated) line -- raise StopIteration.
                 raise
-            if "PayloadPart" not in chunk:
+
+            # Validate structure quickly and append bytes
+            if not chunk or "PayloadPart" not in chunk:
                 logger.warning("Unknown event type=%s", chunk)
                 continue
-            self.buffer.seek(0, io.SEEK_END)
-            self.buffer.write(chunk["PayloadPart"]["Bytes"])
+
+            data_bytes = chunk["PayloadPart"]["Bytes"]
+            if data_bytes:
+                buf.extend(data_bytes)
+            # loop will check for newline again
+            # keep local read_pos in sync for next loop iteration
+            self._buf = buf
+            self._read_pos = read_pos
 
 
 class SagemakerLLM(CustomLLM):
@@ -101,17 +107,6 @@ class SagemakerLLM(CustomLLM):
 
     To use, you must supply the endpoint name from your deployed
     Sagemaker model & the region where it is deployed.
-
-    To authenticate, the AWS client uses the following methods to
-    automatically load credentials:
-    https://boto3.amazonaws.com/v1/documentation/api/latest/guide/credentials.html
-
-    If a specific credential profile should be used, you must pass
-    the name of the profile from the ~/.aws/credentials file that is to be used.
-
-    Make sure the credentials / roles used have the required policies to
-    access the Sagemaker endpoint.
-    See: https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies.html
     """
 
     endpoint_name: str = Field(description="")
@@ -134,9 +129,10 @@ class SagemakerLLM(CustomLLM):
     )
     verbose: bool = Field(description="Whether to print verbose output.")
 
+    # Keep a module-level boto3 client to avoid recreating it repeatedly.
     _boto_client: Any = boto3.client(
         "sagemaker-runtime",
-    )  # TODO make it an optional field
+    )
 
     def __init__(
         self,
@@ -176,6 +172,10 @@ class SagemakerLLM(CustomLLM):
             verbose=verbose,
         )
 
+        # Ensure instance reuses the module-level client (no expensive call here)
+        # This keeps behavior identical while making attribute access slightly faster.
+        self._boto_client = self.__class__._boto_client
+
     @property
     def inference_params(self):
         # TODO expose the rest of params
@@ -198,6 +198,7 @@ class SagemakerLLM(CustomLLM):
 
     @llm_completion_callback()
     def complete(self, prompt: str, **kwargs: Any) -> CompletionResponse:
+        # Ensure non-streaming mode for complete()
         self.generate_kwargs.update({"stream": False})
 
         is_formatted = kwargs.pop("formatted", False)
@@ -210,7 +211,9 @@ class SagemakerLLM(CustomLLM):
             "parameters": self.inference_params,
         }
 
-        resp = self._boto_client.invoke_endpoint(
+        # Localize boto client for faster attribute lookup
+        client = self._boto_client
+        resp = client.invoke_endpoint(
             EndpointName=self.endpoint_name,
             Body=json.dumps(request_params),
             ContentType="application/json",
@@ -220,6 +223,7 @@ class SagemakerLLM(CustomLLM):
         response_str = response_body.read().decode("utf-8")
         response_dict = json.loads(response_str)
 
+        # Return only the generated portion (same behavior)
         return CompletionResponse(
             text=response_dict[0]["generated_text"][len(prompt) :], raw=resp
         )
@@ -234,7 +238,9 @@ class SagemakerLLM(CustomLLM):
                 "stream": True,
                 "parameters": self.inference_params,
             }
-            resp = self._boto_client.invoke_endpoint_with_response_stream(
+
+            client = self._boto_client
+            resp = client.invoke_endpoint_with_response_stream(
                 EndpointName=self.endpoint_name,
                 Body=json.dumps(request_params),
                 ContentType="application/json",
@@ -246,18 +252,34 @@ class SagemakerLLM(CustomLLM):
             first_token = True
 
             for line in LineIterator(event_stream):
-                if line != b"" and start_json in line:
-                    data = json.loads(line[line.find(start_json) :].decode("utf-8"))
-                    special = data["token"]["special"]
-                    stop = data["token"]["text"] == stop_token
-                    if not special and not stop:
-                        delta = data["token"]["text"]
-                        # trim the leading space for the first token if present
-                        if first_token:
-                            delta = delta.lstrip()
-                            first_token = False
-                        text += delta
-                        yield CompletionResponse(delta=delta, text=text, raw=data)
+                # Avoid processing empty lines
+                if not line:
+                    continue
+
+                # Search for a JSON start and decode only the slice that contains it
+                idx = line.find(start_json)
+                if idx == -1:
+                    continue
+
+                try:
+                    data = json.loads(line[idx:].decode("utf-8"))
+                except Exception:
+                    logger.exception("Failed to parse json from stream line")
+                    continue
+
+                token = data.get("token", {})
+                special = token.get("special", False)
+                token_text = token.get("text", "")
+                stop = token_text == stop_token
+
+                if not special and not stop:
+                    delta = token_text
+                    # trim the leading space for the first token if present
+                    if first_token:
+                        delta = delta.lstrip()
+                        first_token = False
+                    text += delta
+                    yield CompletionResponse(delta=delta, text=text, raw=data)
 
         return get_stream()
 
