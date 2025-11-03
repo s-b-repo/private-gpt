@@ -12,34 +12,15 @@ if TYPE_CHECKING:
 def chunk_list(
     lst: Sequence[BaseNode], max_chunk_size: int
 ) -> Generator[Sequence[BaseNode], None, None]:
-    """Yield successive max_chunk_size-sized chunks from lst.
-
-    Args:
-        lst (List[BaseNode]): list of nodes with embeddings
-        max_chunk_size (int): max chunk size
-
-    Yields:
-        Generator[List[BaseNode], None, None]: list of nodes with embeddings
-    """
-    for i in range(0, len(lst), max_chunk_size):
+    """Yield successive max_chunk_size-sized chunks from lst."""
+    # keep simple and clear; range with step is fine
+    n = len(lst)
+    for i in range(0, n, max_chunk_size):
         yield lst[i : i + max_chunk_size]
 
 
 class BatchedChromaVectorStore(ChromaVectorStore):  # type: ignore
-    """Chroma vector store, batching additions to avoid reaching the max batch limit.
-
-    In this vector store, embeddings are stored within a ChromaDB collection.
-
-    During query time, the index uses ChromaDB to query for the top
-    k most similar nodes.
-
-    Args:
-        chroma_client (from chromadb.api.API):
-            API instance
-        chroma_collection (chromadb.api.models.Collection.Collection):
-            ChromaDB collection instance
-
-    """
+    """Chroma vector store, batching additions to avoid reaching the max batch limit."""
 
     chroma_client: Any | None
 
@@ -64,43 +45,45 @@ class BatchedChromaVectorStore(ChromaVectorStore):  # type: ignore
         self.chroma_client = chroma_client
 
     def add(self, nodes: Sequence[BaseNode], **add_kwargs: Any) -> list[str]:
-        """Add nodes to index, batching the insertion to avoid issues.
-
-        Args:
-            nodes: List[BaseNode]: list of nodes with embeddings
-            add_kwargs: _
-        """
+        """Add nodes to index, batching the insertion to avoid issues."""
         if not self.chroma_client:
             raise ValueError("Client not initialized")
 
         if not self._collection:
             raise ValueError("Collection not initialized")
 
+        # cache frequently used attributes / functions locally for speed
         max_chunk_size = self.chroma_client.max_batch_size
-        node_chunks = chunk_list(nodes, max_chunk_size)
+        collection = self._collection
+        node_to_md = node_to_metadata_dict
+        flat_metadata = self.flat_metadata
+        metadata_mode = MetadataMode.NONE
 
-        all_ids = []
-        for node_chunk in node_chunks:
-            embeddings: list[Sequence[float]] = []
-            metadatas: list[Mapping[str, Any]] = []
-            ids = []
-            documents = []
-            for node in node_chunk:
-                embeddings.append(node.get_embedding())
-                metadatas.append(
-                    node_to_metadata_dict(
-                        node, remove_text=True, flat_metadata=self.flat_metadata
-                    )
-                )
-                ids.append(node.node_id)
-                documents.append(node.get_content(metadata_mode=MetadataMode.NONE))
+        all_ids: list[str] = []
+        n = len(nodes)
 
-            self._collection.add(
+        # inline chunking to avoid generator overhead
+        for i in range(0, n, max_chunk_size):
+            node_chunk = nodes[i : i + max_chunk_size]
+
+            # list comprehensions are faster than repeated .append()
+            embeddings = [node.get_embedding() for node in node_chunk]
+            metadatas = [
+                node_to_md(node, remove_text=True, flat_metadata=flat_metadata)
+                for node in node_chunk
+            ]
+            ids = [node.node_id for node in node_chunk]
+            documents = [
+                node.get_content(metadata_mode=metadata_mode) for node in node_chunk
+            ]
+
+            collection.add(
                 embeddings=embeddings,
                 ids=ids,
                 metadatas=metadatas,
                 documents=documents,
             )
+
             all_ids.extend(ids)
 
         return all_ids
